@@ -44,5 +44,6 @@ Created with the philosophy of "Less is More".
 <img width="1099" height="479" alt="Screenshot_30" src="https://github.com/user-attachments/assets/58eb3299-a0ff-4fd0-84ca-2e68d88199c3" />
 <img width="985" height="596" alt="Screenshot_31" src="https://github.com/user-attachments/assets/70a3c440-aae4-4fd6-a960-5802312f8bec" />
 <img width="1275" height="860" alt="Screenshot_33" src="https://github.com/user-attachments/assets/d49f0345-cf3c-4cd1-ac17-215c742a8162" />
-
+<img width="577" height="455" alt="Screenshot_34" src="https://github.com/user-attachments/assets/d1a1acd0-b0d8-477e-8917-91050dba005d" />
+Write custom fps, but if you dont write, you can use video original fps.
 And executable files, ll be made in future.
