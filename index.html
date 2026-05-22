@@ -139,11 +139,11 @@
             transition: width 0.2s linear;
         }
         
-        /* Визуализация загруженного буфера (светлая полоска под основной) */
+        /* Визуализация загруженного буфера (светлая полоска) */
         #buffer-fill {
             position: absolute;
             top: 0; left: 0; height: 100%;
-            background: rgba(255,255,255,0.4);
+            background: rgba(255, 255, 255, 0.35);
             border-radius: 3px;
             width: 0%;
             pointer-events: none;
@@ -247,15 +247,15 @@
         } else {
             if (typeof Hls !== 'undefined' && Hls.isSupported()) {
                 
-                // --- ГЛАВНАЯ МАГИЯ АГРЕССИВНОГО КЭША (200 МБ) ---
+                // --- СТРАТЕГИЯ ВЕЧНОГО ОПЕРЕЖЕНИЯ (МАТЕМАТИКА 300 МБ) ---
                 var hls = new Hls({ 
                     debug: false,
-                    maxBufferSize: 200 * 1024 * 1024, // Жесткий лимит ОЗУ в 200 МБ
-                    maxBufferLength: 120,             // Стараться качать минимум на 2 минуты вперед
-                    maxMaxBufferLength: 900,          // Максимальный буфер до 15 минут (если влезает в 200 МБ)
-                    maxBufferHole: 0.5                // Прощаем мелкие разрывы
+                    maxBufferSize: 300 * 1024 * 1024, // 300 МБ жесткого кэша под фоновый поток
+                    maxBufferLength: 300,             // Фоновый поток безостановочно качает на 5 минут (300 сек) вперед
+                    maxMaxBufferLength: 1200,         // Потолок упреждения до 20 минут плейлиста
+                    maxBufferHole: 0.5                // Заливка микро-дыр в чанках
                 });
-                // ------------------------------------------------
+                // -------------------------------------------------------
                 
                 hls.loadSource(streamUrl);
                 hls.attachMedia(video);
@@ -310,7 +310,7 @@
         var fullBtn = document.getElementById('fullscreen-btn');
         var progressContainer = document.getElementById('progress-container');
         var progressFill = document.getElementById('progress-fill');
-        var bufferFill = document.getElementById('buffer-fill'); // Новая полоска буфера
+        var bufferFill = document.getElementById('buffer-fill'); 
         var timeDisplay = document.getElementById('time-display');
         var tapLeftInd = document.getElementById('tap-left');
         var tapRightInd = document.getElementById('tap-right');
@@ -364,12 +364,11 @@
         video.addEventListener('timeupdate', function() {
             if (!video.duration) return;
             
-            // Движение основной полоски
             var percent = (video.currentTime / video.duration) * 100;
             progressFill.style.width = percent + '%';
             timeDisplay.innerText = formatTime(video.currentTime) + " / " + formatTime(video.duration);
 
-            // Отрисовка серой полоски загруженного буфера (теперь ты увидишь эти 200 МБ в деле!)
+            // Отрисовка летящего вперед буфера в 300 МБ
             if (video.buffered.length > 0) {
                 var bufferedEnd = video.buffered.end(video.buffered.length - 1);
                 var bufferPercent = (bufferedEnd / video.duration) * 100;
