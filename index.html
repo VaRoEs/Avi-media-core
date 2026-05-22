@@ -226,7 +226,7 @@
     <div id="status-msg">Инициализация плеера...</div>
 
     <script>
-        // === 1. ЛОГИКА ЗАГРУЗКИ ПОТОКА (HLS) ===
+        // === 1. УМНАЯ ЛОГИКА ЗАГРУЗКИ ПОТОКА (HLS) ===
         function getQueryParam(name) {
             var match = RegExp('[?&]' + name + '=([^&]*)').exec(window.location.search);
             return match && decodeURIComponent(match[1].replace(/\+/g, ' '));
@@ -241,14 +241,40 @@
             statusMsg.innerHTML = 'URL потока не найден. Запустите видео с главного сервера.';
         } else {
             if (typeof Hls !== 'undefined' && Hls.isSupported()) {
-                var hls = new Hls({ debug: false });
+                // Настройки выживания для слабого железа (Atom)
+                var hls = new Hls({ 
+                    debug: false,
+                    maxMaxBufferLength: 30, // Ограничиваем буфер в ОЗУ до 30 сек
+                    maxBufferHole: 0.5      // Прощаем разрывы между кусками видео до 0.5 сек
+                });
+                
                 hls.loadSource(streamUrl);
                 hls.attachMedia(video);
+                
                 hls.on(Hls.Events.MANIFEST_PARSED, function() {
                     statusMsg.innerHTML = 'Поток готов! Нажмите Play.';
                 });
+
+                // АВТОВОССТАНОВЛЕНИЕ ПРИ ОШИБКАХ
+                hls.on(Hls.Events.ERROR, function (event, data) {
+                    if (data.fatal) {
+                        switch (data.type) {
+                            case Hls.ErrorTypes.NETWORK_ERROR:
+                                console.log("Сетевая ошибка. Пробуем восстановить...");
+                                statusMsg.innerHTML = 'Сбой сети. Восстановление...';
+                                hls.startLoad();
+                                break;
+                            case Hls.ErrorTypes.MEDIA_ERROR:
+                                console.log("Ошибка декодера. Перезапуск движка...");
+                                hls.recoverMediaError(); // Лечим зависший декодер
+                                break;
+                            default:
+                                hls.destroy(); // Если всё совсем плохо
+                                break;
+                        }
+                    }
+                });
             } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-                // Поддержка Safari / iOS
                 video.src = streamUrl;
                 statusMsg.innerHTML = 'Поток готов (Нативный HLS).';
             } else {
@@ -256,6 +282,18 @@
                 statusMsg.innerHTML = 'Ваш браузер слишком стар для стриминга (Нет поддержки MSE).';
             }
         }
+
+        // === 1.1 СТОРОЖЕВОЙ ПЕС (Анти-зависание) ===
+        var lastCurrentTime = -1;
+        setInterval(function() {
+            if (!video.paused && video.readyState >= 3) {
+                if (video.currentTime === lastCurrentTime) {
+                    console.log("Обнаружено мертвое зависание! Даем пинок...");
+                    video.currentTime += 0.1; // Перепрыгиваем битый кадр
+                }
+                lastCurrentTime = video.currentTime;
+            }
+        }, 1500);
 
         // === 2. ЭЛЕМЕНТЫ ИНТЕРФЕЙСА ===
         var wrapper = document.getElementById('player-wrapper');
