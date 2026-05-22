@@ -38,16 +38,15 @@
             overflow: hidden;
             box-shadow: 0 15px 40px rgba(0,0,0,0.8);
             margin-top: 20px;
-            /* Убираем выделение текста при двойных кликах */
             user-select: none; 
             -webkit-user-select: none;
         }
 
-        /* Само видео (без стандартных контролов) */
+        /* Само видео */
         video {
             width: 100%;
-            height: 100%; /* Заставляем видео занимать всю доступную высоту */
-            object-fit: contain; /* Центрирует видео и добавляет ровные черные полосы, сохраняя пропорции */
+            height: 100%; 
+            object-fit: contain; 
             display: block;
             cursor: pointer;
         }
@@ -59,7 +58,7 @@
             max-width: none !important;
             width: 100vw !important;
             height: 100vh !important;
-            margin: 0 !important; /* Убиваем отступ, который может съедать верх */
+            margin: 0 !important; 
             border-radius: 0 !important;
             display: flex;
             align-items: center;
@@ -73,7 +72,7 @@
             cursor: none !important;
         }
 
-        /* === КАСТОМНАЯ ПАНЕЛЬ УПРАВЛЕНИЯ (Glassmorphism) === */
+        /* === КАСТОМНАЯ ПАНЕЛЬ УПРАВЛЕНИЯ === */
         #custom-controls {
             position: absolute;
             bottom: 0;
@@ -88,26 +87,21 @@
             transform: translateY(100%);
             transition: transform 0.3s ease;
             z-index: 10;
-            /* Фолбэк для старых браузеров без поддержки blur */
             border-top: 1px solid rgba(255,255,255,0.1);
         }
 
-        /* Поддержка блюра для современных браузеров */
         @supports (backdrop-filter: blur(10px)) {
             #custom-controls { backdrop-filter: blur(10px); }
         }
 
-        /* Логика показа панели */
         #player-wrapper:hover #custom-controls {
             transform: translateY(0);
         }
         
-        /* Жестко скрываем панель, когда мышка не двигается (idle) */
         #player-wrapper.idle #custom-controls {
             transform: translateY(100%) !important;
         }
         
-        /* Но на паузе панель висит всегда! */
         #player-wrapper.paused #custom-controls {
             transform: translateY(0) !important;
         }
@@ -142,6 +136,18 @@
             border-radius: 3px;
             width: 0%;
             pointer-events: none;
+            transition: width 0.2s linear;
+        }
+        
+        /* Визуализация загруженного буфера (светлая полоска под основной) */
+        #buffer-fill {
+            position: absolute;
+            top: 0; left: 0; height: 100%;
+            background: rgba(255,255,255,0.4);
+            border-radius: 3px;
+            width: 0%;
+            pointer-events: none;
+            z-index: -1;
         }
 
         /* Таймер */
@@ -152,7 +158,7 @@
             text-align: center;
         }
 
-        /* === ИНДИКАТОРЫ ДВОЙНОГО ТАПА (ПЕРЕМОТКИ) === */
+        /* === ИНДИКАТОРЫ ДВОЙНОГО ТАПА === */
         .tap-indicator {
             position: absolute;
             top: 50%;
@@ -168,7 +174,6 @@
             align-items: center;
             gap: 10px;
             z-index: 5;
-            /* Фолбэк */
             border: 1px solid rgba(255,255,255,0.2);
         }
         @supports (backdrop-filter: blur(5px)) {
@@ -178,7 +183,6 @@
         .tap-indicator.left { left: 10%; }
         .tap-indicator.right { right: 10%; }
 
-        /* Анимация вспышки индикатора */
         .tap-indicator.pulse {
             animation: tapPulse 0.5s ease-out forwards;
         }
@@ -208,6 +212,7 @@
             </button>
             
             <div id="progress-container">
+                <div id="buffer-fill"></div>
                 <div id="progress-fill"></div>
             </div>
             
@@ -241,12 +246,16 @@
             statusMsg.innerHTML = 'URL потока не найден. Запустите видео с главного сервера.';
         } else {
             if (typeof Hls !== 'undefined' && Hls.isSupported()) {
-                // Настройки выживания для слабого железа (Atom)
+                
+                // --- ГЛАВНАЯ МАГИЯ АГРЕССИВНОГО КЭША (200 МБ) ---
                 var hls = new Hls({ 
                     debug: false,
-                    maxMaxBufferLength: 30, // Ограничиваем буфер в ОЗУ до 30 сек
-                    maxBufferHole: 0.5      // Прощаем разрывы между кусками видео до 0.5 сек
+                    maxBufferSize: 200 * 1024 * 1024, // Жесткий лимит ОЗУ в 200 МБ
+                    maxBufferLength: 120,             // Стараться качать минимум на 2 минуты вперед
+                    maxMaxBufferLength: 900,          // Максимальный буфер до 15 минут (если влезает в 200 МБ)
+                    maxBufferHole: 0.5                // Прощаем мелкие разрывы
                 });
+                // ------------------------------------------------
                 
                 hls.loadSource(streamUrl);
                 hls.attachMedia(video);
@@ -261,15 +270,14 @@
                         switch (data.type) {
                             case Hls.ErrorTypes.NETWORK_ERROR:
                                 console.log("Сетевая ошибка. Пробуем восстановить...");
-                                statusMsg.innerHTML = 'Сбой сети. Восстановление...';
                                 hls.startLoad();
                                 break;
                             case Hls.ErrorTypes.MEDIA_ERROR:
                                 console.log("Ошибка декодера. Перезапуск движка...");
-                                hls.recoverMediaError(); // Лечим зависший декодер
+                                hls.recoverMediaError(); 
                                 break;
                             default:
-                                hls.destroy(); // Если всё совсем плохо
+                                hls.destroy(); 
                                 break;
                         }
                     }
@@ -289,7 +297,7 @@
             if (!video.paused && video.readyState >= 3) {
                 if (video.currentTime === lastCurrentTime) {
                     console.log("Обнаружено мертвое зависание! Даем пинок...");
-                    video.currentTime += 0.1; // Перепрыгиваем битый кадр
+                    video.currentTime += 0.1; 
                 }
                 lastCurrentTime = video.currentTime;
             }
@@ -302,11 +310,11 @@
         var fullBtn = document.getElementById('fullscreen-btn');
         var progressContainer = document.getElementById('progress-container');
         var progressFill = document.getElementById('progress-fill');
+        var bufferFill = document.getElementById('buffer-fill'); // Новая полоска буфера
         var timeDisplay = document.getElementById('time-display');
         var tapLeftInd = document.getElementById('tap-left');
         var tapRightInd = document.getElementById('tap-right');
 
-        // Форматирование времени (секунды -> ММ:СС)
         function formatTime(seconds) {
             if (isNaN(seconds)) return "00:00";
             var m = Math.floor(seconds / 60);
@@ -346,37 +354,44 @@
             }
         }
 
-        // Перемотка по клику на полосу прогресса
         function scrub(e) {
             var rect = progressContainer.getBoundingClientRect();
             var pos = (e.clientX - rect.left) / rect.width;
             video.currentTime = pos * video.duration;
         }
 
-        // Обновление полоски времени
+        // Обновление полосок времени и скачанного буфера
         video.addEventListener('timeupdate', function() {
+            if (!video.duration) return;
+            
+            // Движение основной полоски
             var percent = (video.currentTime / video.duration) * 100;
             progressFill.style.width = percent + '%';
             timeDisplay.innerText = formatTime(video.currentTime) + " / " + formatTime(video.duration);
+
+            // Отрисовка серой полоски загруженного буфера (теперь ты увидишь эти 200 МБ в деле!)
+            if (video.buffered.length > 0) {
+                var bufferedEnd = video.buffered.end(video.buffered.length - 1);
+                var bufferPercent = (bufferedEnd / video.duration) * 100;
+                bufferFill.style.width = bufferPercent + '%';
+            }
         });
 
-        // Привязка событий к нижним кнопкам
         playBtn.addEventListener('click', togglePlay);
         muteBtn.addEventListener('click', toggleMute);
         fullBtn.addEventListener('click', toggleFullscreen);
         progressContainer.addEventListener('click', scrub);
 
-        // === 4. УМНАЯ ЛОГИКА ТАПОВ ПО ЭКРАНУ (Пауза / Перемотка) ===
+        // === 4. УМНАЯ ЛОГИКА ТАПОВ ПО ЭКРАНУ ===
         var clickTimer = null;
 
         function showTapAnimation(element) {
             element.classList.remove('pulse');
-            void element.offsetWidth; // Магия ES5 для перезапуска анимации
+            void element.offsetWidth;
             element.classList.add('pulse');
         }
 
         wrapper.addEventListener('click', function(e) {
-            // Игнорируем клики, если они попали по нижней панели управления
             if (e.target.closest('#custom-controls')) return;
 
             var rect = wrapper.getBoundingClientRect();
@@ -384,13 +399,11 @@
             var isLeftSide = clickX < (rect.width / 2);
 
             if (clickTimer === null) {
-                // Первый клик: ждем 250мс
                 clickTimer = setTimeout(function() {
                     togglePlay();
                     clickTimer = null;
                 }, 250);
             } else {
-                // Второй клик: отменяем паузу, мотаем время!
                 clearTimeout(clickTimer);
                 clickTimer = null;
 
@@ -409,36 +422,34 @@
             if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
 
             switch(e.keyCode) {
-                case 32: // Пробел
+                case 32: 
                     e.preventDefault();
                     togglePlay();
                     break;
-                case 39: // Стрелка вправо
+                case 39: 
                     video.currentTime += 5;
                     showTapAnimation(tapRightInd);
                     break;
-                case 37: // Стрелка влево
+                case 37: 
                     video.currentTime -= 5;
                     showTapAnimation(tapLeftInd);
                     break;
-                case 70: // Буква F
+                case 70: 
                     toggleFullscreen();
                     break;
-                case 77: // Буква M
+                case 77: 
                     toggleMute();
                     break;
             }
         });
 
-        // === 6. АВТОСКРЫТИЕ ПАНЕЛИ И КУРСОРА (Идеально для Fullscreen) ===
+        // === 6. АВТОСКРЫТИЕ ПАНЕЛИ И КУРСОРА ===
         var hideControlsTimer = null;
 
         function resetActivityTimer() {
-            // Как только пошевелили мышкой — всё показываем
             wrapper.classList.remove('idle');
             clearTimeout(hideControlsTimer);
             
-            // Если видео играет, запускаем обратный отсчет до скрытия (2.5 сек)
             if (!video.paused) {
                 hideControlsTimer = setTimeout(function() {
                     wrapper.classList.add('idle');
@@ -446,20 +457,15 @@
             }
         }
 
-        // Слушаем движения, клики и кнопки
         wrapper.addEventListener('mousemove', resetActivityTimer);
         wrapper.addEventListener('click', resetActivityTimer);
         document.addEventListener('keydown', resetActivityTimer);
         
-        // Если увели мышь за пределы плеера (в оконном режиме)
         wrapper.addEventListener('mouseleave', function() {
             if (!video.paused) wrapper.classList.add('idle');
         });
 
-        // При снятии с паузы запускаем таймер
         video.addEventListener('play', resetActivityTimer);
-        
-        // На паузе железно показываем панель
         video.addEventListener('pause', function() {
             clearTimeout(hideControlsTimer);
             wrapper.classList.remove('idle');
