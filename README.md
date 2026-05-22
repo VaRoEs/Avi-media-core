@@ -20,7 +20,10 @@ Most modern media servers (like Jellyfin or Plex) are "over-engineered" — they
 
 1. **Install FFmpeg:** Download and put `ffmpeg.exe` in the same folder as the script.
 2. **Configure:** Edit the `FOLDER` variable in `avi.py` to point to your video library.
-3. **Run:**
+3. **Make:**
+   ```bash
+   pip install flask flask-cors
+5. **Run:**
    ```bash
    python avi.py
 Deploy: Upload your index.html to your GitHub Pages repository.
@@ -42,3 +45,4 @@ Created with the philosophy of "Less is More".
 <img width="985" height="596" alt="Screenshot_31" src="https://github.com/user-attachments/assets/70a3c440-aae4-4fd6-a960-5802312f8bec" />
 <img width="1275" height="860" alt="Screenshot_33" src="https://github.com/user-attachments/assets/d49f0345-cf3c-4cd1-ac17-215c742a8162" />
 
+And executable files, ll be made in future.
