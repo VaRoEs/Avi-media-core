@@ -26,7 +26,6 @@ Most modern media servers (like Jellyfin or Plex) are "over-engineered" — they
 5. **Run:**
    ```bash
    python avi.py
-Deploy: Upload your index.html to your GitHub Pages repository.
 
 ⚙️ Features
 HLS Streaming: Dynamic video chunking for smooth playback.
