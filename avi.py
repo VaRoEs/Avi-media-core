@@ -10,7 +10,8 @@ import signal
 import sys
 import shutil
 import platform
-from flask import Flask, jsonify, send_from_directory, render_template_string, request, make_response
+import time
+from flask import Flask, jsonify, send_from_directory, render_template_string, request, make_response, redirect
 
 # === Настройки ===
 PORT = 8000
@@ -34,84 +35,128 @@ playlist_lock = threading.Lock()
 ffmpeg_processes = {}
 ffmpeg_lock = threading.Lock()
 
+# Импортируем psutil для надежного поиска процессов
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+    print("✅ psutil загружен - процессы FFmpeg будут надежно очищаться")
+except ImportError:
+    PSUTIL_AVAILABLE = False
+    print("⚠️ psutil не установлен. Установите: pip install psutil")
+
 def kill_ffmpeg_processes(stream_id=None):
-    """Принудительное убийство ffmpeg процессов (особенно для Windows)"""
+    """Абсолютное убийство всех ffmpeg процессов любыми средствами"""
+    
     is_windows = platform.system() == 'Windows'
     
-    if is_windows:
-        if stream_id:
-            with ffmpeg_lock:
-                if stream_id in ffmpeg_processes:
-                    proc = ffmpeg_processes[stream_id]
-                    try:
-                        subprocess.run(['taskkill', '/F', '/PID', str(proc.pid)], capture_output=True)
-                        print(f"🔪 Убит ffmpeg процесс PID: {proc.pid}")
-                    except Exception as e:
-                        print(f"Ошибка taskkill PID: {e}")
-                    try:
-                        proc.terminate()
-                        proc.wait(timeout=2)
-                    except:
-                        try:
-                            proc.kill()
-                        except:
-                            pass
-                    finally:
-                        if stream_id in ffmpeg_processes:
-                            del ffmpeg_processes[stream_id]
-        else:
-            try:
-                result = subprocess.run(['taskkill', '/F', '/IM', 'ffmpeg.exe'], capture_output=True, text=True)
-                if result.returncode == 0:
-                    print("🔪 Убиты все процессы ffmpeg.exe")
-                else:
-                    print(f"ffmpeg.exe не найден или уже остановлен")
-            except Exception as e:
-                print(f"Ошибка при убийстве ffmpeg: {e}")
-            
-            with ffmpeg_lock:
-                for proc in ffmpeg_processes.values():
-                    try:
-                        proc.terminate()
-                    except:
-                        pass
-                ffmpeg_processes.clear()
-    else:
+    # === 1. Сначала пробуем через наш словарь ===
+    with ffmpeg_lock:
         if stream_id and stream_id in ffmpeg_processes:
-            proc = ffmpeg_processes[stream_id]
             try:
-                proc.terminate()
-                proc.wait(timeout=2)
-            except:
-                proc.kill()
-            if stream_id in ffmpeg_processes:
+                proc = ffmpeg_processes[stream_id]
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=1)
                 del ffmpeg_processes[stream_id]
+                print(f"🔪 Убит процесс из словаря: {stream_id}")
+            except Exception as e:
+                print(f"Ошибка при убийстве из словаря: {e}")
         elif not stream_id:
-            with ffmpeg_lock:
-                for proc in ffmpeg_processes.values():
-                    try:
-                        proc.terminate()
-                    except:
-                        pass
-                ffmpeg_processes.clear()
+            for sid, proc in list(ffmpeg_processes.items()):
+                try:
+                    if proc.poll() is None:
+                        proc.kill()
+                        proc.wait(timeout=1)
+                    print(f"🔪 Убит процесс: {sid}")
+                except:
+                    pass
+            ffmpeg_processes.clear()
+    
+    # === 2. Жёсткое убийство через системные команды ===
+    if is_windows:
+        # Windows: убиваем ВСЕ ffmpeg без вопросов
+        os.system('taskkill /F /IM ffmpeg.exe 2>nul')
+        os.system('taskkill /F /IM ffmpeg.exe /T 2>nul')
+        os.system('wmic process where "name=\'ffmpeg.exe\'" delete 2>nul')
+        os.system('powershell -Command "Get-Process ffmpeg -ErrorAction SilentlyContinue | Stop-Process -Force" 2>nul')
+    else:
+        # Linux/Mac: убиваем без возможности восстановления
+        os.system('pkill -9 ffmpeg 2>/dev/null')
+        os.system('killall -9 ffmpeg 2>/dev/null')
+        os.system('ps aux | grep ffmpeg | grep -v grep | awk \'{print $2}\' | xargs kill -9 2>/dev/null')
+    
+    # === 3. Дополнительно: убиваем через psutil ===
+    if PSUTIL_AVAILABLE:
+        killed_count = 0
+        for proc in psutil.process_iter(['pid', 'name', 'exe', 'cmdline']):
+            try:
+                proc_name = proc.info['name'].lower() if proc.info['name'] else ''
+                proc_exe = proc.info['exe'].lower() if proc.info['exe'] else ''
+                cmdline = ' '.join(proc.info['cmdline']).lower() if proc.info['cmdline'] else ''
+                
+                if ('ffmpeg' in proc_name or 
+                    'ffmpeg' in proc_exe or 
+                    'ffmpeg' in cmdline):
+                    print(f"🔪 Убиваем FFmpeg через psutil (PID: {proc.info['pid']})")
+                    proc.kill()
+                    proc.wait(timeout=1)
+                    killed_count += 1
+            except:
+                continue
+        if killed_count > 0:
+            print(f"💀 Уничтожено процессов FFmpeg: {killed_count}")
+    
+    time.sleep(0.5)  # Даем время системе на завершение процессов
+    print("✅ Все процессы FFmpeg уничтожены")
 
 def cleanup_all_processes():
     """Очистка всех ffmpeg процессов при завершении сервера"""
+    print("🧹 Очистка процессов FFmpeg при завершении...")
     kill_ffmpeg_processes()
 
 atexit.register(cleanup_all_processes)
 
 def signal_handler(sig, frame):
+    print("\n🛑 Получен сигнал остановки, завершаем FFmpeg...")
     kill_ffmpeg_processes()
     sys.exit(0)
 
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
+def ffmpeg_worker(stream_id, command):
+    """Воркер для запуска FFmpeg, ожидания его завершения и очистки зомби-процессов"""
+    kwargs = {}
+    is_windows = platform.system() == 'Windows'
+    
+    if is_windows:
+        kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+
+    try:
+        proc = subprocess.Popen(
+            command, 
+            stdin=subprocess.PIPE, 
+            stdout=subprocess.DEVNULL, 
+            stderr=subprocess.DEVNULL,
+            **kwargs
+        )
+        with ffmpeg_lock:
+            ffmpeg_processes[stream_id] = proc
+            print(f"🎬 Запущен FFmpeg процесс (PID: {proc.pid}) для {stream_id}")
+        
+        proc.wait()
+    except Exception as e:
+        print(f"Ошибка воркера FFmpeg: {e}")
+    finally:
+        with ffmpeg_lock:
+            if stream_id in ffmpeg_processes:
+                del ffmpeg_processes[stream_id]
+
 def get_secure_path(filename):
     """Защита от Path Traversal (выхода за пределы FOLDER)"""
     base_dir = os.path.abspath(FOLDER)
-    target_path = os.path.abspath(os.path.join(FOLDER, urllib.parse.unquote(filename)))
+    safe_filename = urllib.parse.unquote(filename).lstrip('/\\')
+    target_path = os.path.abspath(os.path.join(FOLDER, safe_filename))
     if not target_path.startswith(base_dir):
         return None
     return target_path
@@ -257,11 +302,10 @@ def pop_playlist():
     return jsonify(pl)
 
 # ==========================================
-# ОСТАНОВКА КОНВЕРТАЦИИ (С ПОДДЕРЖКОЙ WINDOWS)
+# ОСТАНОВКА КОНВЕРТАЦИИ
 # ==========================================
 @app.route('/stop/<stream_id>', methods=['POST'])
 def stop_conversion(stream_id):
-    """Остановка конвертации видео (с поддержкой Windows)"""
     kill_ffmpeg_processes(stream_id)
     
     # Удаляем временные файлы
@@ -273,9 +317,30 @@ def stop_conversion(stream_id):
 
 @app.route('/stop_all', methods=['POST'])
 def stop_all_conversions():
-    """Остановка всех конвертаций (с поддержкой Windows)"""
     kill_ffmpeg_processes()
     return jsonify({"status": "stopped", "stopped": "all"})
+
+@app.route('/emergency_kill', methods=['POST'])
+def emergency_kill():
+    """Экстренное убийство ВСЕХ ffmpeg процессов"""
+    is_windows = platform.system() == 'Windows'
+    
+    # Самый жесткий вариант
+    if is_windows:
+        os.system('taskkill /F /IM ffmpeg.exe /T')
+        os.system('wmic process where "name=\'ffmpeg.exe\'" call terminate')
+        os.system('powershell -Command "Get-Process ffmpeg | Stop-Process -Force"')
+    else:
+        os.system('pkill -9 ffmpeg')
+        os.system('killall -9 ffmpeg')
+        os.system('ps aux | grep ffmpeg | grep -v grep | awk \'{print $2}\' | xargs kill -9 2>/dev/null')
+    
+    # Очищаем кэш словаря
+    with ffmpeg_lock:
+        ffmpeg_processes.clear()
+    
+    print("🔥 Экстренное убийство всех FFmpeg процессов выполнено!")
+    return jsonify({"status": "emergency kill executed", "message": "Все FFmpeg процессы уничтожены"})
 
 # ==========================================
 # 1. МАРШРУТ: ГЛАВНАЯ СТРАНИЦА (ГАЛЕРЕЯ)
@@ -455,6 +520,8 @@ def index():
     .path-indicator {{ color: #888; font-size: 14px; background: rgba(255,255,255,0.05); padding: 8px 16px; border-radius: 20px; flex-grow: 1; }}
     .sort-select, .action-btn {{ background: #1e1e2d; color: #e0e0e0; border: 1px solid rgba(255,255,255,0.2); padding: 8px 15px; border-radius: 20px; outline: none; font-size: 14px; cursor: pointer; transition: 0.2s; text-decoration: none; }}
     .action-btn:hover {{ background: #2196f3; color: white; border-color: #2196f3; box-shadow: 0 4px 10px rgba(33, 150, 243, 0.2); }}
+    .emergency-btn {{ background: #f44336; border-color: #f44336; }}
+    .emergency-btn:hover {{ background: #d32f2f; transform: scale(1.05); }}
     
     #playlist-bar {{
         display: none; justify-content: space-between; align-items: center; background: linear-gradient(90deg, rgba(30,30,45,0.8), rgba(42,42,63,0.8));
@@ -528,7 +595,7 @@ def index():
 </head>
 <body>
 
-    <h1><i class="fas fa-server"></i> AVI Media Core</h1>
+    <h1><i class="fas fa-skull"></i> AVI Media Core</h1>
     
     <div id="playlist-bar">
         <div><i class="fas fa-list"></i> <span id="current-pl-name" style="cursor:pointer; border-bottom: 1px dashed #888; color: #2196f3; padding-bottom: 2px;" onclick="renamePlaylist()" title="Изменить название">Новый плейлист</span>: <strong id="pl-count">0</strong> медиа <i class="fas fa-pen" style="font-size:11px; color:#888; cursor:pointer; margin-left: 5px;" onclick="renamePlaylist()"></i></div>
@@ -545,6 +612,7 @@ def index():
         <div style="display: flex; gap: 10px; flex-wrap: wrap;">
             <a href="/?p={urllib.parse.quote(rel_path)}&lite=1" class="action-btn"><i class="fas fa-mobile-alt"></i> Lite Режим</a>
             <button class="action-btn" onclick="addAllToPlaylist()"><i class="fas fa-plus-circle"></i> Добавить всё</button>
+            <button class="action-btn emergency-btn" onclick="emergencyKillFFmpeg()"><i class="fas fa-skull-crossbones"></i> УБИТЬ FFMPEG</button>
             <select class="sort-select" id="sort-select" onchange="sortCards()">
                 <option value="name_asc">Имя (А-Я)</option>
                 <option value="name_desc">Имя (Я-А)</option>
@@ -608,6 +676,28 @@ def index():
     <script>
         let currentStreamId = null;
         let currentCheckInterval = null;
+        
+        async function emergencyKillFFmpeg() {{
+            if (confirm("⚠️ ЭТО УБЬЁТ ВСЕ ПРОЦЕССЫ FFMPEG!\\n\\nВидео может прерваться. Продолжить?")) {{
+                try {{
+                    const res = await fetch('/emergency_kill', {{ method: 'POST' }});
+                    const data = await res.json();
+                    
+                    if (currentStreamId) {{
+                        currentStreamId = null;
+                    }}
+                    if (currentCheckInterval) {{
+                        clearInterval(currentCheckInterval);
+                        currentCheckInterval = null;
+                    }}
+                    
+                    alert("✅ Все процессы FFmpeg принудительно завершены!");
+                    location.reload();
+                }} catch(e) {{
+                    alert("Ошибка: " + e);
+                }}
+            }}
+        }}
         
         function sortCards() {{
             const grid = document.getElementById('media-grid');
@@ -991,7 +1081,7 @@ PLAYER_HTML = """<!DOCTYPE html>
 <html>
 <head>
     <meta charset="utf-8">
-    <title>AVI Player</title>
+    <title>AVI Player - С остановкой FFmpeg</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
@@ -1015,6 +1105,7 @@ PLAYER_HTML = """<!DOCTYPE html>
 
         .ctrl-btn { background: none; border: none; color: #fff; font-size: 20px; cursor: pointer; transition: 0.2s; padding: 0; width: 30px; }
         .ctrl-btn:hover { color: #2196f3; }
+        .kill-btn { color: #f44336; } .kill-btn:hover { color: #ff0000; }
         #next-btn { color: #ffca28; display: none; } #next-btn:hover { color: #fff; }
 
         #progress-container { flex-grow: 1; height: 6px; background: rgba(255,255,255,0.2); border-radius: 3px; cursor: pointer; position: relative; }
@@ -1102,6 +1193,7 @@ PLAYER_HTML = """<!DOCTYPE html>
             </div>
             
             <button id="playlist-toggle-btn" class="ctrl-btn" title="Плейлист" style="display: none;"><i class="fas fa-bars"></i></button>
+            <button id="kill-ffmpeg-btn" class="ctrl-btn kill-btn" title="УБИТЬ FFMPEG"><i class="fas fa-skull-crossbones"></i></button>
             <button id="fullscreen-btn" class="ctrl-btn"><i class="fas fa-expand"></i></button>
         </div>
     </div>
@@ -1124,6 +1216,19 @@ PLAYER_HTML = """<!DOCTYPE html>
         let currentCheckInterval = null;
         let currentHls = null;
         let isLoadingVideo = false;
+        
+        async function emergencyKillFFmpeg() {
+            if (confirm("⚠️ УБИТЬ ВСЕ ПРОЦЕССЫ FFMPEG?\\nВидео прервется!")) {
+                try {
+                    await fetch('/emergency_kill', { method: 'POST' });
+                    await fullStop();
+                    statusMsg.innerHTML = '✅ FFmpeg убит. <a href="/">Вернуться в галерею</a>';
+                    showStopNotification('💀 FFmpeg уничтожен!');
+                } catch(e) {
+                    console.error('Kill error:', e);
+                }
+            }
+        }
         
         var urlParams = new URLSearchParams(window.location.search);
         var streamUrl = urlParams.get('stream');
@@ -1157,6 +1262,9 @@ PLAYER_HTML = """<!DOCTYPE html>
         var loadingOverlay = document.getElementById('loading-overlay');
         var progressBar = document.getElementById('progress-bar');
         var statusText = document.getElementById('status-text');
+        var killBtn = document.getElementById('kill-ffmpeg-btn');
+        
+        if (killBtn) killBtn.addEventListener('click', emergencyKillFFmpeg);
 
         function showStopNotification(message) {
             const notification = document.createElement('div');
@@ -1515,6 +1623,7 @@ PLAYER_HTML = """<!DOCTYPE html>
             if (e.code === 'ArrowLeft') { video.currentTime -= 5; }
             if (e.code === 'KeyF') { fullscreenBtn.click(); }
             if (e.code === 'KeyM') { muteBtn.click(); }
+            if (e.code === 'KeyK') { emergencyKillFFmpeg(); }
         });
         
         var hideControlsTimer = null;
@@ -1580,204 +1689,196 @@ def lite_playlist():
 @app.route('/lite_player')
 def lite_player():
     file = request.args.get('file', '')
-    safe_js_file = file.replace('\\', '\\\\').replace('"', '\\"').replace("'", "\\'")
-    
+    safe_name = urllib.parse.quote(file)
+
     html = f"""
     <html>
     <head>
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Выбор качества (Lite)</title>
-        <script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
         <style>
-            body {{ background:#111; color:#fff; text-align:center; padding-top:20px; font-family:sans-serif; }}
-            .fps-input-group {{ margin: 15px auto; width: 90%; max-width: 300px; }}
-            .fps-input-group input {{ width: 100%; padding: 12px; border-radius: 8px; border: 1px solid #444; background: #222; color: white; font-size: 16px; box-sizing: border-box; text-align: center; }}
-            .quality-btn {{ display:block; width:90%; max-width:400px; margin:10px auto; padding:15px; border-radius:8px; font-size:16px; cursor:pointer; border: none; transition: 0.2s; }}
-            .retro-btn {{ background:#607d8b; color:#fff; }}
-            .retro-btn:hover {{ background:#78909c; }}
-            .low-btn {{ background:#4caf50; color:#fff; }}
-            .low-btn:hover {{ background:#66bb6a; }}
-            .medium-btn {{ background:#ff9800; color:#fff; }}
-            .medium-btn:hover {{ background:#ffb74d; }}
-            .cinema-btn {{ background:#9c27b0; color:#fff; }}
-            .cinema-btn:hover {{ background:#ba68c8; }}
-            .high-btn {{ background:#f44336; color:#fff; }}
-            .high-btn:hover {{ background:#e57373; }}
-            .back-btn {{ background:transparent; color:#888; border:1px solid #444; border-radius:5px; padding:10px 15px; margin-top:20px; cursor:pointer; }}
-            .back-btn:hover {{ background:#444; color:#fff; }}
-            #loading {{ display:none; margin-top:50px; }}
-            .status-text {{ color:#ffca28; font-size:18px; margin-top:20px; }}
-            .loader {{ font-size: 50px; display: inline-block; animation: spin 2s linear infinite; }}
-            @keyframes spin {{ 100% {{ transform: rotate(360deg); }} }}
-            #cancel-btn {{ margin-top: 20px; background: #f44336; border: none; color: white; padding: 10px 20px; border-radius: 20px; cursor: pointer; font-size: 14px; }}
-            #cancel-btn:hover {{ background: #d32f2f; }}
-            
-            @keyframes fadeOut {{
-                0% {{ opacity: 1; transform: translateY(0); }}
-                70% {{ opacity: 1; transform: translateY(0); }}
-                100% {{ opacity: 0; transform: translateY(-20px); }}
-            }}
-            .stop-notification {{
-                position: fixed;
-                bottom: 20px;
-                right: 20px;
-                background: #f44336;
-                color: white;
-                padding: 12px 24px;
-                border-radius: 8px;
-                z-index: 10000;
-                animation: fadeOut 2s ease-out forwards;
-                font-size: 14px;
-                font-weight: bold;
-                box-shadow: 0 4px 15px rgba(0,0,0,0.3);
-            }}
+            body {{ background:#111; color:#fff; text-align:center; padding-top:20px; font-family:sans-serif; margin:15px; }}
+            h3 {{ color:#2196f3; word-break: break-word; }}
+            .fps-input-group {{ margin: 20px auto; max-width: 400px; text-align: left; }}
+            .fps-input-group label {{ color:#888; font-size:14px; display:block; margin-bottom:8px; }}
+            .fps-input-group input {{ width:100%; padding:10px; border-radius:8px; border:1px solid #444; background:#151520; color:white; font-size:16px; box-sizing:border-box; }}
+            .quality-btn {{ display:block; width:90%; max-width:400px; margin:12px auto; padding:15px; border-radius:8px; font-size:16px; cursor:pointer; border:none; color:#fff; text-decoration:none; text-align:center; box-sizing:border-box; }}
+            .retro-btn {{ background:#607d8b; }}
+            .low-btn {{ background:#4caf50; }}
+            .medium-btn {{ background:#ff9800; }}
+            .cinema-btn {{ background:#9c27b0; }}
+            .high-btn {{ background:#f44336; }}
+            .back-btn {{ background:transparent; color:#888; border:1px solid #444; border-radius:5px; padding:10px 15px; margin-top:20px; cursor:pointer; display:inline-block; text-decoration:none; }}
         </style>
     </head>
     <body>
-    
-    <div id="menu">
-        <h3 style="color:#2196f3; padding: 0 10px; word-break: break-word;">🎬 {urllib.parse.unquote(file)}</h3>
-        <p style="color:#bbb; margin-bottom: 20px;">Выберите качество:</p>
-        
-        <div class="fps-input-group">
-            <label style="color:#bbb;"><i class="fas fa-tachometer-alt"></i> FPS (оставьте пустым для исходного):</label>
-            <input type="number" id="lite-fps-input" placeholder="Напр. 24, 30, 60">
-        </div>
-        
-        <button class="quality-btn retro-btn" onclick="startProcessing('mpeg1')">📺 Ретро (MPEG1 480p)</button>
-        <button class="quality-btn low-btn" onclick="startProcessing('low')">📱 Слабый (360p)</button>
-        <button class="quality-btn medium-btn" onclick="startProcessing('medium')">💻 Средний (720p)</button>
-        <button class="quality-btn cinema-btn" onclick="startProcessing('cinema')">🍿 Кино (720p HQ)</button>
-        <button class="quality-btn high-btn" onclick="startProcessing('high')">🔥 Высокий (Исходное)</button>
-        
-        <br>
-        <button class="back-btn" onclick="window.history.back()">⬅ Назад</button>
-    </div>
+        <h3>🎬 {urllib.parse.unquote(file)}</h3>
+        <p style="color:#bbb; margin-bottom:15px;">Выберите качество:</p>
 
-    <div id="loading">
+        <div class="fps-input-group">
+            <label for="fps-input">🎛️ FPS (необязательно):</label>
+            <input type="number" id="fps-input" placeholder="Исходный (напр. 24, 60)">
+        </div>
+
+        <a class="quality-btn retro-btn" href="/lite_start?file={safe_name}&quality=mpeg1">📺 Ретро (MPEG1 480p)</a>
+        <a class="quality-btn low-btn" href="/lite_start?file={safe_name}&quality=low">📱 Слабый (360p)</a>
+        <a class="quality-btn medium-btn" href="/lite_start?file={safe_name}&quality=medium">💻 Средний (720p)</a>
+        <a class="quality-btn cinema-btn" href="/lite_start?file={safe_name}&quality=cinema">🍿 Кино (720p HQ)</a>
+        <a class="quality-btn high-btn" href="/lite_start?file={safe_name}&quality=high">🔥 Высокий (Исходное)</a>
+
+        <br>
+        <a class="back-btn" href="javascript:history.back()">⬅ Назад</a>
+
+        <script>
+            document.querySelectorAll('.quality-btn').forEach(function(btn) {{
+                btn.addEventListener('click', function(e) {{
+                    var fps = document.getElementById('fps-input').value.trim();
+                    if (fps) {{
+                        e.preventDefault();
+                        window.location.href = this.href + '&fps=' + encodeURIComponent(fps);
+                    }}
+                }});
+            }});
+        </script>
+    </body>
+    </html>
+    """
+    return render_template_string(html)
+
+@app.route('/lite_start')
+def lite_start():
+    filename = request.args.get('file', '')
+    quality = request.args.get('quality', 'medium')
+    fps = request.args.get('fps', '').strip()
+
+    video_path = get_secure_path(filename)
+    if not video_path:
+        return "Access Denied", 403
+
+    file_size = os.stat(video_path).st_size
+    cache_key = f"{os.path.basename(video_path)}_{file_size}"
+
+    duration = 0.0
+    with meta_lock:
+        if os.path.exists(META_FILE):
+            try:
+                with open(META_FILE, 'r') as f:
+                    meta_cache = json.load(f)
+                    duration = meta_cache.get(cache_key, 0.0)
+            except Exception:
+                pass
+
+    if duration == 0.0:
+        duration = get_media_duration(video_path)
+        with meta_lock:
+            meta_cache = {}
+            if os.path.exists(META_FILE):
+                try:
+                    with open(META_FILE, 'r') as f:
+                        meta_cache = json.load(f)
+                except Exception:
+                    pass
+            meta_cache[cache_key] = duration
+            try:
+                with open(META_FILE, 'w') as f:
+                    json.dump(meta_cache, f)
+            except Exception:
+                pass
+
+    if 0 < duration < 120:
+        return redirect(f'/direct/{filename}')
+
+    stream_id = hashlib.md5(f"{filename}_{quality}_{fps}".encode()).hexdigest()
+    stream_dir = os.path.join(HLS_CACHE, stream_id)
+    os.makedirs(stream_dir, exist_ok=True)
+    m3u8_file = os.path.join(stream_dir, 'index.m3u8')
+
+    is_fully_cached = False
+    if os.path.exists(m3u8_file):
+        try:
+            with open(m3u8_file, 'r', encoding='utf-8') as f:
+                if '#EXT-X-ENDLIST' in f.read():
+                    is_fully_cached = True
+        except:
+            pass
+
+    if not is_fully_cached:
+        kill_ffmpeg_processes(stream_id)
+
+        total_cores = os.cpu_count() or 4
+        threads_to_use = max(1, int(total_cores * 0.75))
+
+        command = ['ffmpeg', '-i', video_path, '-g', '50', '-keyint_min', '50', '-sc_threshold', '0', '-threads', str(threads_to_use)]
+        if fps and fps.isdigit():
+            command.extend(['-r', fps])
+
+        if quality == 'mpeg1':
+            command.extend(['-c:v', 'libx264', '-preset', 'ultrafast', '-vf', 'scale=-2:480', '-b:v', '800k', '-maxrate', '800k', '-bufsize', '1600k', '-c:a', 'aac', '-b:a', '96k'])
+        else:
+            command.extend(['-c:v', 'libx264'])
+            if quality == 'low':
+                command.extend(['-preset', 'ultrafast', '-vf', 'scale=-2:360', '-crf', '32', '-maxrate', '400k', '-bufsize', '800k', '-c:a', 'aac', '-b:a', '64k'])
+            elif quality == 'high':
+                command.extend(['-preset', 'ultrafast', '-crf', '23', '-maxrate', '5000k', '-bufsize', '10000k', '-c:a', 'aac', '-b:a', '192k'])
+            elif quality == 'cinema':
+                command.extend(['-preset', 'medium', '-vf', 'scale=-2:720', '-crf', '24', '-maxrate', '2500k', '-bufsize', '5000k', '-c:a', 'aac', '-b:a', '192k'])
+            else:
+                command.extend(['-preset', 'ultrafast', '-vf', 'scale=-2:720', '-crf', '28', '-maxrate', '1500k', '-bufsize', '3000k', '-c:a', 'aac', '-b:a', '128k'])
+
+        command.extend(['-start_number', '0', '-hls_time', '5', '-hls_list_size', '0', '-hls_playlist_type', 'event', '-f', 'hls', m3u8_file])
+
+        print(f"🎬 Запуск FFmpeg HLS (Lite): {quality} | FPS: {fps if fps else 'auto'} | ID: {stream_id}")
+
+        thread = threading.Thread(target=ffmpeg_worker, args=(stream_id, command))
+        thread.daemon = True
+        thread.start()
+
+    if is_fully_cached:
+        return redirect(f'/lite_video?stream={stream_id}')
+    else:
+        return redirect(f'/lite_wait?stream_id={stream_id}&file={urllib.parse.quote(filename)}')
+
+@app.route('/lite_wait')
+def lite_wait():
+    stream_id = request.args.get('stream_id', '')
+    filename = request.args.get('file', '')
+
+    stream_dir = os.path.join(HLS_CACHE, stream_id)
+    ready = os.path.exists(os.path.join(stream_dir, 'index.m3u8')) and len([f for f in os.listdir(stream_dir) if f.endswith('.ts')]) >= 1
+
+    if ready:
+        return redirect(f'/lite_video?stream={stream_id}')
+
+    html = f"""
+    <html>
+    <head>
+        <meta http-equiv="refresh" content="3">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Подготовка...</title>
+        <style>
+            body {{ background:#111; color:#fff; text-align:center; padding-top:50px; font-family:sans-serif; }}
+            .loader {{ font-size: 40px; animation: spin 2s linear infinite; display:inline-block; }}
+            @keyframes spin {{ 100% {{ transform: rotate(360deg); }} }}
+            p {{ color:#888; margin-top:20px; }}
+            a {{ color:#888; text-decoration:none; margin-top:30px; display:inline-block; }}
+        </style>
+    </head>
+    <body>
         <div class="loader">⏳</div>
         <h3 style="color:#2196f3;">Подготовка видео...</h3>
-        <p id="status" class="status-text">Отправка запроса на сервер...</p>
-        <button id="cancel-btn">Отменить</button>
-        <br><button class="back-btn" onclick="window.location.reload()">Перезагрузить</button>
-    </div>
-
-    <script>
-        let currentStreamId = null;
-        let currentCheckInterval = null;
-        let isProcessing = false;
-        
-        function showStopNotification(message) {{
-            const notification = document.createElement('div');
-            notification.className = 'stop-notification';
-            notification.innerHTML = '<i class="fas fa-stop-circle"></i> ' + message;
-            document.body.appendChild(notification);
-            setTimeout(() => notification.remove(), 2000);
-        }}
-        
-        function startProcessing(quality) {{
-            if (isProcessing) return;
-            isProcessing = true;
-            
-            document.getElementById("menu").style.display = "none";
-            document.getElementById("loading").style.display = "block";
-            
-            var file = "{safe_js_file}";
-            var fpsValue = document.getElementById('lite-fps-input').value;
-            
-            var xhr = new XMLHttpRequest();
-            xhr.open("POST", "/prepare/" + file, true);
-            xhr.setRequestHeader("Content-Type", "application/json");
-            
-            xhr.onreadystatechange = function() {{
-                if (xhr.readyState === 4) {{
-                    if (xhr.status === 200) {{
-                        try {{
-                            var data = JSON.parse(xhr.responseText);
-                            if (data.status === 'direct') {{
-                                window.location.href = "/direct/" + encodeURIComponent(file);
-                            }} else if (data.cached) {{
-                                document.getElementById("status").innerText = "✅ Найдено в кеше! Запуск...";
-                                setTimeout(function() {{ 
-                                    window.location.href = "/lite_video?stream=" + data.stream_id; 
-                                }}, 500);
-                            }} else {{
-                                document.getElementById("status").innerText = "🔄 Рендеринг потока. Ожидание...";
-                                currentStreamId = data.stream_id;
-                                currentCheckInterval = setInterval(function() {{
-                                    var xhr2 = new XMLHttpRequest();
-                                    xhr2.open("GET", "/status/" + currentStreamId, true);
-                                    xhr2.onreadystatechange = function() {{
-                                        if (xhr2.readyState === 4 && xhr2.status === 200) {{
-                                            var st = JSON.parse(xhr2.responseText);
-                                            if (st.ready) {{
-                                                clearInterval(currentCheckInterval);
-                                                currentCheckInterval = null;
-                                                document.getElementById("status").innerText = "✅ Готово! Запуск...";
-                                                window.location.href = "/lite_video?stream=" + currentStreamId;
-                                            }}
-                                        }}
-                                    }};
-                                    xhr2.send();
-                                }}, 2000);
-                            }}
-                        }} catch (e) {{
-                            document.getElementById("status").innerText = "❌ Ошибка: " + e.message;
-                            document.getElementById("status").style.color = "#f44336";
-                            isProcessing = false;
-                        }}
-                    }} else {{
-                        document.getElementById("status").innerText = "❌ Ошибка сервера: " + xhr.status;
-                        document.getElementById("status").style.color = "#f44336";
-                        isProcessing = false;
-                    }}
-                }}
-            }};
-            
-            xhr.send(JSON.stringify({{quality: quality, fps: fpsValue}}));
-        }}
-        
-        document.getElementById('cancel-btn').addEventListener('click', async function() {{
-            if (currentStreamId) {{
-                try {{
-                    await fetch('/stop/' + currentStreamId, {{ method: 'POST' }});
-                    showStopNotification('⏹️ Конвертация остановлена');
-                }} catch(e) {{}}
-            }}
-            if (currentCheckInterval) clearInterval(currentCheckInterval);
-            isProcessing = false;
-            window.location.reload();
-        }});
-        
-        document.addEventListener('keydown', async function(e) {{
-            if (e.code === 'Escape') {{
-                e.preventDefault();
-                if (currentStreamId) {{
-                    try {{
-                        await fetch('/stop/' + currentStreamId, {{ method: 'POST' }});
-                        showStopNotification('⏹️ FFmpeg остановлен по ESC');
-                    }} catch(e) {{}}
-                    if (currentCheckInterval) clearInterval(currentCheckInterval);
-                    isProcessing = false;
-                    window.location.reload();
-                }}
-            }}
-        }});
-        
-        window.addEventListener('beforeunload', function() {{
-            if (currentStreamId) {{
-                navigator.sendBeacon('/stop/' + currentStreamId);
-            }}
-        }});
-    </script>
-    </body></html>
+        <p>Ожидание конвертации потока. Автообновление через 3 сек...</p>
+        <a href="/">← Назад в галерею</a>
+    </body>
+    </html>
     """
     return render_template_string(html)
 
 @app.route('/lite_video')
 def lite_video():
     stream_id = request.args.get('stream', '')
+    video_url = f"/stream/{stream_id}/index.m3u8"
+
     html = f"""
     <!DOCTYPE html>
     <html>
@@ -1785,11 +1886,11 @@ def lite_video():
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
         <title>AVI Player Lite</title>
-        <script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
         <style>
             body {{
                 background: #000;
                 margin: 0;
+                padding: 0;
                 display: flex;
                 align-items: center;
                 justify-content: center;
@@ -1797,43 +1898,12 @@ def lite_video():
                 flex-direction: column;
                 font-family: sans-serif;
             }}
-            .video-container {{
-                position: relative;
-                width: 100%;
-                max-width: 100%;
-                background: #000;
-            }}
             video {{
                 width: 100%;
-                height: auto;
-                max-height: 90vh;
-                object-fit: contain;
-            }}
-            .controls {{
-                position: fixed;
-                bottom: 20px;
-                left: 0;
-                right: 0;
-                display: flex;
-                justify-content: center;
-                gap: 15px;
-                padding: 10px;
-                background: rgba(0,0,0,0.7);
-                z-index: 100;
-            }}
-            button {{
-                background: #2196f3;
-                border: none;
-                color: white;
-                padding: 12px 24px;
-                border-radius: 30px;
-                font-size: 16px;
-                cursor: pointer;
-                transition: 0.2s;
-            }}
-            button:hover {{
-                background: #1976d2;
-                transform: scale(1.05);
+                max-width: 100%;
+                max-height: 100vh;
+                background: #000;
+                display: block;
             }}
             .back-btn {{
                 position: fixed;
@@ -1846,152 +1916,13 @@ def lite_video():
                 text-decoration: none;
                 z-index: 100;
                 font-size: 14px;
-            }}
-            .back-btn:hover {{
-                background: rgba(0,0,0,0.8);
-            }}
-            .status {{
-                position: fixed;
-                bottom: 100px;
-                left: 0;
-                right: 0;
-                text-align: center;
-                color: #ff9800;
-                font-size: 14px;
-                padding: 10px;
-                background: rgba(0,0,0,0.5);
-                z-index: 100;
-            }}
-            .error {{
-                color: #f44336;
+                font-family: sans-serif;
             }}
         </style>
     </head>
     <body>
         <a href="javascript:history.back()" class="back-btn">← Назад</a>
-        
-        <div class="video-container">
-            <video id="video" controls playsinline></video>
-        </div>
-        
-        <div class="controls">
-            <button id="play-btn">▶ Воспроизвести</button>
-        </div>
-        <div id="status" class="status">⏳ Загрузка видео...</div>
-
-        <script>
-            var video = document.getElementById('video');
-            var playBtn = document.getElementById('play-btn');
-            var statusDiv = document.getElementById('status');
-            var streamId = "{stream_id}";
-            var videoUrl = "/stream/" + streamId + "/index.m3u8";
-            var hls = null;
-            var retryCount = 0;
-            
-            function showStatus(msg, isError) {{
-                statusDiv.innerHTML = msg;
-                if (isError) {{
-                    statusDiv.classList.add('error');
-                }} else {{
-                    statusDiv.classList.remove('error');
-                }}
-            }}
-            
-            function initVideo() {{
-                showStatus('🔄 Загрузка потока...');
-                
-                if (Hls.isSupported()) {{
-                    if (hls) {{
-                        hls.destroy();
-                    }}
-                    hls = new Hls({{
-                        debug: false,
-                        enableWorker: true,
-                        lowLatencyMode: true,
-                        maxBufferLength: 30
-                    }});
-                    hls.loadSource(videoUrl);
-                    hls.attachMedia(video);
-                    
-                    hls.on(Hls.Events.MANIFEST_PARSED, function() {{
-                        showStatus('✅ Готово! Нажмите Play');
-                        video.play().then(() => {{
-                            showStatus('▶ Воспроизведение');
-                        }}).catch(e => {{
-                            showStatus('ℹ️ Нажмите Play для начала', false);
-                        }});
-                    }});
-                    
-                    hls.on(Hls.Events.ERROR, function(event, data) {{
-                        if (data.fatal) {{
-                            switch(data.type) {{
-                                case Hls.ErrorTypes.NETWORK_ERROR:
-                                    if (retryCount < 3) {{
-                                        retryCount++;
-                                        showStatus('⚠️ Ошибка сети. Переподключение... (' + retryCount + '/3)');
-                                        setTimeout(() => initVideo(), 2000);
-                                    }} else {{
-                                        showStatus('❌ Не удалось загрузить видео. Проверьте соединение.', true);
-                                    }}
-                                    break;
-                                default:
-                                    showStatus('❌ Ошибка воспроизведения', true);
-                                    break;
-                            }}
-                        }}
-                    }});
-                }} else if (video.canPlayType('application/vnd.apple.mpegurl')) {{
-                    video.src = videoUrl;
-                    video.addEventListener('loadedmetadata', function() {{
-                        showStatus('✅ Готово! Нажмите Play');
-                    }});
-                }} else {{
-                    showStatus('❌ Ваш браузер не поддерживает HLS поток', true);
-                }}
-            }}
-            
-            playBtn.addEventListener('click', function() {{
-                video.play()
-                    .then(() => {{
-                        showStatus('▶ Воспроизведение');
-                    }})
-                    .catch(e => {{
-                        console.error('Play error:', e);
-                        showStatus('⚠️ Нажмите еще раз для воспроизведения', false);
-                    }});
-            }});
-            
-            video.addEventListener('playing', function() {{
-                showStatus('▶ Воспроизведение');
-            }});
-            
-            video.addEventListener('pause', function() {{
-                showStatus('⏸ Пауза');
-            }});
-            
-            video.addEventListener('waiting', function() {{
-                showStatus('⏳ Буферизация...');
-            }});
-            
-            video.addEventListener('error', function(e) {{
-                console.error('Video error:', e);
-                showStatus('❌ Ошибка видео', true);
-            }});
-            
-            video.addEventListener('canplay', function() {{
-                if (video.readyState >= 3) {{
-                    showStatus('✅ Готово к воспроизведению');
-                }}
-            }});
-            
-            initVideo();
-            
-            window.addEventListener('beforeunload', function() {{
-                if (streamId) {{
-                    navigator.sendBeacon('/stop/' + streamId);
-                }}
-            }});
-        </script>
+        <video src="{video_url}" controls autoplay playsinline preload="auto"></video>
     </body>
     </html>
     """
@@ -2079,7 +2010,7 @@ def prepare_video(filename):
         if fps and fps.isdigit(): command.extend(['-r', fps])
 
         if quality == 'mpeg1':
-            command.extend(['-c:v', 'mpeg1video', '-vf', 'scale=-2:480', '-b:v', '800k', '-c:a', 'mp2', '-b:a', '128k'])
+            command.extend(['-c:v', 'libx264', '-preset', 'ultrafast', '-vf', 'scale=-2:480', '-b:v', '800k', '-maxrate', '800k', '-bufsize', '1600k', '-c:a', 'aac', '-b:a', '96k'])
         else:
             command.extend(['-c:v', 'libx264'])
             if quality == 'low': command.extend(['-preset', 'ultrafast', '-vf', 'scale=-2:360', '-crf', '32', '-maxrate', '400k', '-bufsize', '800k', '-c:a', 'aac', '-b:a', '64k'])
@@ -2090,10 +2021,10 @@ def prepare_video(filename):
         command.extend(['-start_number', '0', '-hls_time', '5', '-hls_list_size', '0', '-hls_playlist_type', 'event', '-f', 'hls', m3u8_file])
         
         print(f"🎬 Запуск FFmpeg HLS: {quality} | FPS: {fps if fps else 'auto'} | ID: {stream_id}")
-        proc = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         
-        with ffmpeg_lock:
-            ffmpeg_processes[stream_id] = proc
+        thread = threading.Thread(target=ffmpeg_worker, args=(stream_id, command))
+        thread.daemon = True
+        thread.start()
             
     return jsonify({"status": "processing", "stream_id": stream_id, "cached": is_fully_cached})
 
@@ -2125,10 +2056,9 @@ def serve_hls(stream_id, file):
     return response
 
 if __name__ == '__main__':
-    print(f"🚀 [On-Premise Ultimate V3.6] AVI Media Core запущен на порту {PORT}!")
+    print("=" * 60)
+    print("=" * 60)
+    print(f"🚀 Сервер запущен на порту {PORT}!")
     print(f"   📁 Медиа папка: {FOLDER}")
-    print(f"   🛑 API остановки: /stop/<stream_id> | /stop_all")
-    print(f"   🪟 Поддержка Windows: taskkill /F /IM ffmpeg.exe")
-    print(f"   🌐 Основной интерфейс: http://localhost:{PORT}/")
-    print(f"   📱 Lite режим: http://localhost:{PORT}/?lite=1")
+    
     app.run(host='0.0.0.0', port=PORT, debug=False, threaded=True)
